@@ -42,6 +42,17 @@ def find_pages(pages, question, k=10):
 st.title("BIT Study Tutor")
 st.caption("AI answers can be wrong, especially in maths. Always double-check.")
 
+col_a, col_b = st.columns([1, 3])
+with col_a:
+    if os.path.exists("me.jpg"):
+        st.image("me.jpg", width=200)
+with col_b:
+    st.markdown(
+        "**Built by Avinav Tomar** · 1st-year CSE, BIT Mesra  \n"
+        "[GitHub](https://github.com/realavinavtomar-tech) · "
+        "[LinkedIn](https://www.linkedin.com/in/avinav-tomar-973152299/)"
+    )
+
 uploaded = st.file_uploader("Upload a PYQ or notes PDF", type="pdf")
 pages = []
 if uploaded:
