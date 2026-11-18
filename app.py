@@ -3,13 +3,14 @@ import json
 import os
 import random
 import re
+import threading
 import time
 
 import streamlit as st
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 
 try:
     import reportlab  # noqa: F401  (only needed for PDF downloads)
@@ -67,7 +68,40 @@ MIME_TYPES = {
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".webp": "image/webp",
+    ".heic": "image/heic",
+    ".heif": "image/heif",
 }
+IMAGE_EXTS = ("png", "jpg", "jpeg", "webp", "heic", "heif")
+
+# Handwritten / photographed notes
+MAX_VISION_PAGES = 30  # Study tab
+MAX_NOTES_VISION_PAGES = 40  # Exam Mode notes
+MAX_PAPER_SCAN_PAGES = 30  # one scanned past paper
+MAX_COMPRESS_SCAN_PAGES = 60
+MAX_IMAGES = 12
+MAX_IMAGE_SIDE = 2000
+HANDWRITING_RULE = (
+    "Some pages may be handwritten, photographed or low quality. Read them "
+    "carefully, keep the writer's meaning, write [unclear] where a word "
+    "cannot be read, and never invent content."
+)
+
+# AI reliability: retries, queueing and fallback models
+FALLBACK_MODELS = [
+    m.strip()
+    for m in os.environ.get(
+        "GEMINI_FALLBACK_MODELS", "gemini-3.5-flash-lite,gemini-2.5-flash"
+    ).split(",")
+    if m.strip()
+]
+MIN_INTERVAL = float(os.environ.get("GEMINI_MIN_INTERVAL", "1.0"))  # seconds between calls
+MAX_INTERVAL = 12.0
+MAX_QUEUE_WAIT = 25.0  # longest a request waits in line before we say "busy"
+MAX_ATTEMPTS = 3  # tries per model
+MAX_RETRY_DELAY = 20.0
+TOTAL_BUDGET = 75.0  # give up on one request after this many seconds
+DEAD_SECONDS = 1800  # skip a model for this long after its daily limit is hit
+REQUEST_TIMEOUT_MS = 90_000
 
 MOTIVATION = [
     "You don't have to feel ready to start. Start, and the readiness follows.",
@@ -105,50 +139,166 @@ TUTOR_RULES = (
 )
 
 API_KEY = os.environ.get("GEMINI_API_KEY")
-client = genai.Client(api_key=API_KEY) if API_KEY else None
+
+
+def make_client():
+    if not API_KEY:
+        return None
+    try:
+        return genai.Client(
+            api_key=API_KEY,
+            http_options=types.HttpOptions(timeout=REQUEST_TIMEOUT_MS),
+        )
+    except Exception:
+        return genai.Client(api_key=API_KEY)
+
+
+client = make_client()
 
 
 # ---------- AI helpers ----------
+class AIError(Exception):
+    """An AI request failed. `kind` says why (daily, rate, transient, ...)."""
+
+    def __init__(self, kind, detail=""):
+        super().__init__(f"{kind}: {detail}" if detail else kind)
+        self.kind = kind
+
+
+def classify_error(e):
+    if isinstance(e, AIError):
+        return e.kind
+    msg = str(e).lower()
+    if re.search(r"per ?day|daily", msg):
+        return "daily"
+    if re.search(r"\b429\b|resource_exhausted|quota|rate limit|too many requests", msg):
+        return "rate"
+    if re.search(
+        r"\b(500|502|503|504)\b|unavailable|overloaded|internal|deadline|"
+        r"timed out|timeout|connection|reset by peer",
+        msg,
+    ):
+        return "transient"
+    if re.search(r"\b404\b|not_found|is not found|not supported for generatecontent", msg):
+        return "model"
+    if re.search(r"\b(401|403)\b|api key|api_key|permission_denied|unauthenticated", msg):
+        return "auth"
+    if re.search(r"\b413\b|too large|payload|exceeds the maximum|request entity", msg):
+        return "toolarge"
+    if re.search(r"safety|blocked|prohibited|recitation", msg):
+        return "blocked"
+    return "unknown"
+
+
+ERROR_MESSAGES = {
+    "daily": "Today's free usage limit has been reached. Please try again tomorrow.",
+    "rate": "The tutor is very busy right now. Please try again in a minute.",
+    "transient": "The AI service is having a moment. Please try again in a minute.",
+    "model": "The AI service is having a moment. Please try again in a minute.",
+    "blocked": (
+        "I couldn't answer that one. Try rewording your question or "
+        "choosing different pages."
+    ),
+    "toolarge": "That file is too large for me to read. Try fewer pages or a smaller file.",
+    "auth": "The tutor is temporarily unavailable. Please try again later.",
+    "badjson": "I couldn't put that together this time. Please try again.",
+}
+
+
+def friendly_error(e):
+    kind = classify_error(e)
+    print(f"[tutor] error ({kind}): {e}")  # details go to the server logs only
+    return ERROR_MESSAGES.get(kind, "Something went wrong. Please try again in a minute.")
+
+
+def retry_hint(e):
+    msg = str(e)
+    m = re.search(r"retry in ([\d.]+)\s*s", msg, re.I) or re.search(
+        r"retryDelay\W+(\d+(?:\.\d+)?)s", msg, re.I
+    )
+    return float(m.group(1)) if m else None
+
+
+@st.cache_resource
+def _throttle():
+    """Shared by every visitor: spaces out requests so bursts don't hit the limit."""
+    return {"lock": threading.Lock(), "next": 0.0, "interval": MIN_INTERVAL, "dead": {}}
+
+
+def _take_turn():
+    state = _throttle()
+    with state["lock"]:
+        now = time.time()
+        wait = max(0.0, state["next"] - now)
+        if wait > MAX_QUEUE_WAIT:
+            raise AIError("rate", "queue is full")
+        state["next"] = max(now, state["next"]) + state["interval"]
+    if wait:
+        time.sleep(wait)
+
+
+def _note_result(ok, rate_limited=False):
+    state = _throttle()
+    with state["lock"]:
+        if rate_limited:
+            # slow everyone down a bit: the shared limit was hit
+            state["interval"] = min(MAX_INTERVAL, state["interval"] * 2)
+            state["next"] = max(state["next"], time.time() + state["interval"])
+        elif ok:
+            state["interval"] = max(MIN_INTERVAL, state["interval"] * 0.9)
+
+
 def _generate(contents, as_json):
     config = (
         types.GenerateContentConfig(response_mime_type="application/json")
         if as_json
         else None
     )
-    response = client.models.generate_content(
-        model=MODEL, contents=contents, config=config
-    )
-    return response.text or ""
-
-
-# Identical requests (for example the same PYQ papers uploaded by different
-# students) are answered from a shared cache, which saves quota and time.
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False, max_entries=200)
-def _cached_text(prompt):
-    return _generate(prompt, False)
-
-
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False, max_entries=200)
-def _cached_json_text(prompt):
-    return _generate(prompt, True)
-
-
-def _with_files(prompt, files):
-    parts = []
-    for name, data in files:
-        mime = MIME_TYPES.get(os.path.splitext(name.lower())[1], "application/pdf")
-        parts.append(types.Part.from_bytes(data=data, mime_type=mime))
-    return parts + [prompt]
-
-
-def ask(prompt, files=None, cache=True):
-    if files:
-        text = _generate(_with_files(prompt, files), False)
-    elif cache:
-        text = _cached_text(prompt)
-    else:
-        text = _generate(prompt, False)
-    return text or "I couldn't generate an answer. Please try rephrasing."
+    state = _throttle()
+    models = [MODEL] + [m for m in FALLBACK_MODELS if m != MODEL]
+    deadline = time.time() + TOTAL_BUDGET
+    last = "unknown"
+    for model in models:
+        if state["dead"].get(model, 0) > time.time():
+            last = "daily"
+            continue
+        for attempt in range(MAX_ATTEMPTS):
+            if time.time() > deadline:
+                raise AIError(last)
+            _take_turn()
+            try:
+                response = client.models.generate_content(
+                    model=model, contents=contents, config=config
+                )
+                try:
+                    text = response.text
+                except Exception:
+                    text = None
+                if not text:
+                    raise AIError("blocked", "empty response")
+                _note_result(True)
+                return text
+            except AIError:
+                raise
+            except Exception as e:
+                kind = classify_error(e)
+                last = kind
+                print(f"[tutor] {model} attempt {attempt + 1}: {kind}: {str(e)[:300]}")
+                if kind == "daily":
+                    state["dead"][model] = time.time() + DEAD_SECONDS
+                    break  # try the next model
+                if kind in ("rate", "transient"):
+                    if kind == "rate":
+                        _note_result(False, rate_limited=True)
+                    if attempt < MAX_ATTEMPTS - 1:
+                        delay = min(retry_hint(e) or (2**attempt) * 2, MAX_RETRY_DELAY)
+                        time.sleep(delay + random.random())
+                        continue
+                    break  # out of retries: try the next model
+                if kind == "model":
+                    break  # this model isn't available: try the next one
+                raise AIError(kind, str(e)[:200])
+    raise AIError(last)
 
 
 def parse_json(text):
@@ -166,26 +316,61 @@ def parse_json(text):
     return None
 
 
-def ask_json(prompt, files=None, cache=True):
+def valid_json(data, require=None):
+    if not isinstance(data, dict):
+        return False
+    return not require or (isinstance(data.get(require), list) and len(data[require]) > 0)
+
+
+# Identical requests (for example the same PYQ papers uploaded by different
+# students) are answered from a shared cache. Failures are never cached.
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False, max_entries=200)
+def _cached_text(prompt):
+    return _generate(prompt, False)
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False, max_entries=200)
+def _cached_json_text(prompt, require):
+    text = _generate(prompt, True)
+    if not valid_json(parse_json(text), require):
+        raise AIError("badjson")
+    return text
+
+
+def _with_files(prompt, files):
+    parts = []
+    for name, data in files:
+        mime = MIME_TYPES.get(os.path.splitext(name.lower())[1], "application/pdf")
+        parts.append(types.Part.from_bytes(data=data, mime_type=mime))
+    return parts + [prompt]
+
+
+def ask(prompt, files=None, cache=True):
     if files:
-        text = _generate(_with_files(prompt, files), True)
-    elif cache:
-        text = _cached_json_text(prompt)
-    else:
-        text = _generate(prompt, True)
-    return parse_json(text)
+        return _generate(_with_files(prompt, files), False)
+    if cache:
+        return _cached_text(prompt)
+    return _generate(prompt, False)
 
 
-def friendly_error(e):
-    msg = str(e)
-    print(f"[tutor] error: {msg}")  # real error goes to server logs only
-    low = msg.lower()
-    if "429" in low or "resource_exhausted" in low or "quota" in low:
-        return (
-            "The tutor is busy right now (free usage limit reached). "
-            "Please try again in a minute."
-        )
-    return "Something went wrong. Please try again in a minute."
+def ask_json(prompt, files=None, cache=True, require=None):
+    """Ask for JSON. Retries once if the reply isn't usable."""
+    for attempt in range(2):
+        try:
+            if files:
+                text = _generate(_with_files(prompt, files), True)
+            elif cache and attempt == 0:
+                text = _cached_json_text(prompt, require)
+            else:
+                text = _generate(prompt, True)
+        except AIError as e:
+            if e.kind == "badjson" and attempt == 0:
+                continue
+            raise
+        data = parse_json(text)
+        if valid_json(data, require):
+            return data
+    raise AIError("badjson")
 
 
 # ---------- PDF + search helpers ----------
@@ -212,6 +397,90 @@ def load_pdf(uploaded):
     if sum(len(p.strip()) for p in pages) < 100:
         return None, "scanned"
     return pages, None
+
+
+def is_pdf(upload):
+    return upload.name.lower().endswith(".pdf")
+
+
+@st.cache_data(show_spinner=False)
+def pdf_page_count(data):
+    reader = PdfReader(io.BytesIO(data))
+    if reader.is_encrypted and not reader.decrypt(""):
+        raise ValueError("password-protected")
+    return len(reader.pages)
+
+
+@st.cache_data(show_spinner=False)
+def extract_pdf_pages(data, start, end):
+    """A smaller PDF with just pages start..end (1-based, inclusive)."""
+    reader = PdfReader(io.BytesIO(data))
+    if reader.is_encrypted:
+        reader.decrypt("")
+    writer = PdfWriter()
+    for i in range(start - 1, end):
+        writer.add_page(reader.pages[i])
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+@st.cache_data(show_spinner=False)
+def shrink_image(name, data):
+    """Make photos smaller and upright so they upload and read faster."""
+    try:
+        from PIL import Image, ImageOps
+
+        img = ImageOps.exif_transpose(Image.open(io.BytesIO(data))).convert("RGB")
+        img.thumbnail((MAX_IMAGE_SIDE, MAX_IMAGE_SIDE))
+        out = io.BytesIO()
+        img.save(out, "JPEG", quality=85)
+        return os.path.splitext(name)[0] + ".jpg", out.getvalue()
+    except Exception:
+        return name, data
+
+
+def vision_attachments(uploads, start=None, end=None, max_pages=MAX_VISION_PAGES):
+    """Turn handwritten/scanned uploads into files for the AI to look at.
+
+    Returns (files, message). files is None when something is wrong and the
+    message explains what to do. Otherwise message is an optional note.
+    """
+    pdfs = [u for u in uploads if is_pdf(u)]
+    images = [u for u in uploads if not is_pdf(u)]
+    if pdfs and images:
+        return None, "Please upload either one PDF or photos, not both."
+    if len(pdfs) > 1:
+        return None, "Please upload one PDF at a time (or several photos)."
+
+    if pdfs:
+        data = pdfs[0].getvalue()
+        try:
+            total = pdf_page_count(data)
+        except Exception:
+            return None, "This PDF couldn't be read (it may be locked or damaged)."
+        first = max(1, int(start or 1))
+        last = min(total, int(end or total))
+        note = None
+        if last - first + 1 > max_pages:
+            last = first + max_pages - 1
+            note = f"Too many pages at once, so I'm using pages {first}-{last}."
+        if last < first:
+            return None, "That page range is empty. Please pick valid pages."
+        try:
+            out = extract_pdf_pages(data, first, last)
+        except Exception:
+            return None, "Couldn't read those pages. Try a different range or file."
+        if len(out) > MAX_SCANNED_BYTES:
+            return None, "Those pages are too large. Pick fewer pages (or a smaller file)."
+        return [("notes.pdf", out)], note
+
+    if len(images) > MAX_IMAGES:
+        return None, f"Please upload at most {MAX_IMAGES} photos at a time."
+    files = [shrink_image(u.name, u.getvalue()) for u in images]
+    if sum(len(d) for _, d in files) > MAX_SCANNED_BYTES:
+        return None, "Those photos are too large in total. Upload fewer or smaller ones."
+    return files, None
 
 
 def keywords(question):
@@ -272,8 +541,8 @@ def notes_source(notes_text, notes_attached, strict):
         )
     if notes_attached:
         return (
-            "Use ONLY the attached PDF, which is the student's notes. If it "
-            "doesn't cover something, say so."
+            "Use ONLY the attached file(s), which are the student's notes. "
+            "If they don't cover something, say so. " + HANDWRITING_RULE
         )
     return (
         "The student gave no notes, so use standard B.Tech knowledge"
@@ -290,7 +559,7 @@ def plan_prompt(subject, pyq_text, scan_names):
     attached = (
         "Some papers are attached as PDF files, in this order: "
         + ", ".join(scan_names)
-        + ". Read them too.\n"
+        + ". Read them too. " + HANDWRITING_RULE + "\n"
         if scan_names
         else ""
     )
@@ -499,21 +768,25 @@ def reset_quiz():
     st.session_state.pop("quiz_result", None)
 
 
-def load_notes(notes_file):
-    """Return (pages, scan_files). Scanned notes are sent to the AI as a PDF."""
-    if not notes_file:
+def load_notes(notes_uploads):
+    """Return (pages, files). Handwritten or scanned notes are sent as images."""
+    notes_uploads = notes_uploads or []
+    if not notes_uploads:
         return [], []
-    pages, code = load_pdf(notes_file)
-    if code == "scanned":
-        data = notes_file.getvalue()
-        if len(data) <= MAX_SCANNED_BYTES:
-            return [], [(notes_file.name, data)]
-        st.warning("Your notes are a scanned PDF that's too large (over 15 MB), so I'll skip them.")
+    if len(notes_uploads) == 1 and is_pdf(notes_uploads[0]):
+        pages, code = load_pdf(notes_uploads[0])
+        if code is None:
+            return pages, []
+        if code != "scanned":
+            st.warning(f"Your notes {ERR_TEXT[code]}, so I'll skip them.")
+            return [], []
+    files, msg = vision_attachments(notes_uploads, max_pages=MAX_NOTES_VISION_PAGES)
+    if files is None:
+        st.warning(f"{msg} I'll skip your notes.")
         return [], []
-    if code:
-        st.warning(f"Your notes {ERR_TEXT[code]}, so I'll skip them.")
-        return [], []
-    return pages, []
+    if msg:
+        st.caption(msg)
+    return [], files
 
 
 def build_plan(pyq_files, subject):
@@ -526,18 +799,29 @@ def build_plan(pyq_files, subject):
 
     texts, scans, scan_bytes = [], [], 0
     for f in pyq_files:
-        pages, code = load_pdf(f)
-        if code == "scanned":
-            data = f.getvalue()
-            if scan_bytes + len(data) > MAX_SCANNED_BYTES:
-                st.warning(f"{f.name} is too large to read as a scan. Skipping it.")
+        if is_pdf(f):
+            pages, code = load_pdf(f)
+            if code is None:
+                texts.append((f.name, "\n".join(pages)))
                 continue
-            scan_bytes += len(data)
-            scans.append((f.name, data))
-        elif code:
-            st.warning(f"{f.name} {ERR_TEXT[code]}. Skipping it.")
+            if code != "scanned":
+                st.warning(f"{f.name} {ERR_TEXT[code]}. Skipping it.")
+                continue
+            try:
+                data = f.getvalue()
+                if pdf_page_count(data) > MAX_PAPER_SCAN_PAGES:
+                    data = extract_pdf_pages(data, 1, MAX_PAPER_SCAN_PAGES)
+            except Exception:
+                st.warning(f"{f.name} could not be read. Skipping it.")
+                continue
+            item = (f.name, data)
         else:
-            texts.append((f.name, "\n".join(pages)))
+            item = shrink_image(f.name, f.getvalue())
+        if scan_bytes + len(item[1]) > MAX_SCANNED_BYTES:
+            st.warning(f"{f.name} is too large to read as a scan. Skipping it.")
+            continue
+        scan_bytes += len(item[1])
+        scans.append(item)
     if not texts and not scans:
         st.error("None of the papers could be read.")
         return
@@ -553,16 +837,24 @@ def build_plan(pyq_files, subject):
             data = ask_json(
                 plan_prompt(subject, pyq_text, [name for name, _ in scans]),
                 files=scans,
+                require="topics",
             )
         except Exception as e:
-            st.error(friendly_error(e))
+            if classify_error(e) == "badjson":
+                print(f"[tutor] no usable plan: {e}")
+                st.error(
+                    "I couldn't find clear patterns in these papers. "
+                    "Try different or clearer files."
+                )
+            else:
+                st.error(friendly_error(e))
             return
 
     plan = clean_plan(data)
     if not plan:
         st.error(
             "I couldn't find clear patterns in these papers. "
-            "Try different or clearer PDFs."
+            "Try different or clearer files."
         )
         return
     plan["papers"] = len(texts) + len(scans)
@@ -615,6 +907,7 @@ def make_quiz(subject, topics, questions, notes_text, notes_files, difficulty="M
                 quiz_prompt(subject, topics, questions, notes_text, bool(notes_files), difficulty),
                 files=notes_files,
                 cache=False,  # a retake should give new questions
+                require="questions",
             )
             quiz = clean_quiz(data)
         except Exception as e:
@@ -771,14 +1064,15 @@ def exam_tab():
         "Days until your exam", [1, 2, 3, 5, 7, 14], index=2, key="exam_days"
     )
     pyq_files = st.file_uploader(
-        "Past papers (PYQs). Upload 2 or more for best results",
-        type="pdf",
+        "Past papers (PYQs, PDFs or photos). Upload 2 or more for best results",
+        type=["pdf"] + list(IMAGE_EXTS),
         accept_multiple_files=True,
         key="pyq_files",
     )
-    notes_file = st.file_uploader(
-        "Your notes (optional, but makes answers match your syllabus)",
-        type="pdf",
+    notes_uploads = st.file_uploader(
+        "Your notes (optional): PDF, handwritten pages or photos",
+        type=["pdf"] + list(IMAGE_EXTS),
+        accept_multiple_files=True,
         key="notes_file",
     )
 
@@ -790,7 +1084,7 @@ def exam_tab():
         return
     show_plan(plan, days)
 
-    notes_pages, notes_files = load_notes(notes_file)
+    notes_pages, notes_files = load_notes(notes_uploads)
     if not notes_pages and not notes_files:
         st.info(
             "No notes uploaded, so the sheet, quiz and grading use general "
@@ -846,31 +1140,60 @@ def exam_tab():
 
 # ---------- Study tab ----------
 def study_tab():
-    uploaded = st.file_uploader("Upload a PYQ or notes PDF", type="pdf", key="study_pdf")
-    pages = []
-    if uploaded:
-        pages, code = load_pdf(uploaded)
-        if code == "scanned":
-            st.error(
-                "This PDF looks scanned (image-only), and this tab can't read "
-                "scans. Exam Mode can read scanned past papers and notes."
-            )
-            return
-        if code:
-            st.error(f"This PDF {ERR_TEXT[code]}. Please try a different file.")
-            return
-        st.success(f"Read {len(pages)} pages")
-
-    mode = st.radio(
-        "Which pages should I use?",
-        ["Auto-find relevant pages", "Choose page range"],
-        horizontal=True,
+    uploads = st.file_uploader(
+        "Upload your notes (PDF or photos)",
+        type=["pdf"] + list(IMAGE_EXTS),
+        accept_multiple_files=True,
+        key="study_files",
+    ) or []
+    force_vision = st.checkbox(
+        "My notes are handwritten, or the text looks messy (read the pages as images)",
+        key="study_vision",
     )
+    st.caption("Tip: for handwritten notes, use clear, well-lit photos or scans.")
 
+    pages, vision, total_pages = [], False, 0
+    one_pdf = len(uploads) == 1 and is_pdf(uploads[0])
+    if uploads:
+        if one_pdf:
+            pages, code = load_pdf(uploads[0])
+            if code in ("unreadable", "locked"):
+                st.error(f"This PDF {ERR_TEXT[code]}. Please try a different file.")
+                return
+            vision = force_vision or code == "scanned"
+        else:
+            vision = True
+        if vision and one_pdf:
+            try:
+                total_pages = pdf_page_count(uploads[0].getvalue())
+            except Exception:
+                st.error("This PDF couldn't be read. Please try a different file.")
+                return
+            st.info(
+                "Reading the pages as images, which works for handwriting. "
+                "Pick the pages that contain your topic."
+            )
+        elif vision:
+            st.info(f"Reading {len(uploads)} file(s) as images.")
+        else:
+            st.success(f"Read {len(pages)} pages")
+
+    mode = "Auto-find relevant pages"
     start, end = 1, 1
-    if pages and mode == "Choose page range":
-        start = st.number_input("From page", 1, len(pages), 1)
-        end = st.number_input("To page", start, len(pages), min(len(pages), start + 14))
+    if vision and total_pages:
+        start = st.number_input("From page", 1, total_pages, 1)
+        end = st.number_input(
+            "To page", start, total_pages, min(total_pages, start + MAX_VISION_PAGES - 1)
+        )
+    elif not vision:
+        mode = st.radio(
+            "Which pages should I use?",
+            ["Auto-find relevant pages", "Choose page range"],
+            horizontal=True,
+        )
+        if pages and mode == "Choose page range":
+            start = st.number_input("From page", 1, len(pages), 1)
+            end = st.number_input("To page", start, len(pages), min(len(pages), start + 14))
 
     question = st.text_area(
         "Question or topic (for example: causes of water pollution)",
@@ -891,8 +1214,8 @@ def study_tab():
 
     if not action:
         return
-    if not pages:
-        st.warning("Upload a PDF first.")
+    if not uploads:
+        st.warning("Upload your notes first.")
         return
 
     question = question.strip()
@@ -900,37 +1223,53 @@ def study_tab():
         st.warning("Type a question or topic first.")
         return
 
-    if mode == "Auto-find relevant pages":
-        if not question:
-            st.warning("Type a topic so I can find the right pages.")
+    files, material = None, ""
+    if vision:
+        files, msg = vision_attachments(uploads, start, end, MAX_VISION_PAGES)
+        if files is None:
+            st.warning(msg)
             return
-        idx = find_pages(pages, question)
-        if not idx:
-            st.warning(
-                "Couldn't find matching pages. Try different words, "
-                "or use 'Choose page range'."
-            )
-            return
+        if msg:
+            st.caption(msg)
     else:
-        idx = list(range(start - 1, end))
+        if mode == "Auto-find relevant pages":
+            if not question:
+                st.warning("Type a topic so I can find the right pages.")
+                return
+            idx = find_pages(pages, question)
+            if not idx:
+                st.warning(
+                    "Couldn't find matching pages. Try different words, or "
+                    "tick the handwritten/messy box above, or use 'Choose page range'."
+                )
+                return
+        else:
+            idx = list(range(int(start) - 1, int(end)))
+        material = "\n\n".join(f"[Page {i + 1}]\n{pages[i]}" for i in idx)
+        st.caption("Using pages: " + ", ".join(str(i + 1) for i in idx))
+        if len(material) > MAX_MATERIAL_CHARS:
+            st.caption(
+                "Some of the selected pages were trimmed to fit. "
+                "For better results, narrow your topic or page range."
+            )
 
     if not allow_call():
         return
 
-    material = "\n\n".join(f"[Page {i + 1}]\n{pages[i]}" for i in idx)
-    st.caption("Using pages: " + ", ".join(str(i + 1) for i in idx))
-    if len(material) > MAX_MATERIAL_CHARS:
-        st.caption(
-            "Some of the selected pages were trimmed to fit. "
-            "For better results, narrow your topic or page range."
-        )
-
     rules = (
         TUTOR_RULES
         + INJECTION_RULE
-        + "Use only the study material below. If it doesn't cover "
-        "something, say so clearly.\n\n"
+        + "Use only the study material. If it doesn't cover something, say so clearly.\n\n"
     )
+    if files:
+        source = (
+            "The study material is attached: pages of the student's notes, "
+            "possibly handwritten or photographed. " + HANDWRITING_RULE + "\n\n"
+        )
+        extra = " Look through ALL attached pages for the relevant part." if action == "explain" else ""
+    else:
+        source = f"STUDY MATERIAL:\n{material[:MAX_MATERIAL_CHARS]}\n\n"
+        extra = ""
     if action == "explain":
         task = f"Explain step by step: {question}"
     elif action == "mcq":
@@ -947,9 +1286,7 @@ def study_tab():
 
     with st.spinner("Thinking..."):
         try:
-            answer = ask(
-                f"{rules}STUDY MATERIAL:\n{material[:MAX_MATERIAL_CHARS]}\n\nTASK:\n{task}"
-            )
+            answer = ask(f"{rules}{source}TASK:\n{task}{extra}", files=files)
             st.write(answer)
         except Exception as e:
             st.error(friendly_error(e))
@@ -1099,7 +1436,7 @@ def compress_prompt(target_words, part, n_parts, text):
         if n_parts > 1
         else ""
     )
-    source = ("NOTES:\n" + text) if text else "The notes are attached as a PDF."
+    source = ("NOTES:\n" + text) if text else "The notes are attached. " + HANDWRITING_RULE
     return (
         INJECTION_RULE
         + "Condense the student's long notes into short revision notes for "
@@ -1127,37 +1464,50 @@ def compress_tab():
     level = st.radio("How short?", list(COMPRESS_LEVELS), key="compress_level")
     ratio = COMPRESS_LEVELS[level]
 
-    pages, scan = [], []
+    pages, scanned, n_pages = [], False, 0
     start, end = 1, 1
     if uploaded:
         pages, code = load_pdf(uploaded)
         if code == "scanned":
-            data = uploaded.getvalue()
-            if len(data) > MAX_SCANNED_BYTES:
-                st.error("This scanned PDF is too large (over 15 MB). Try a smaller file.")
+            scanned = True
+            try:
+                n_pages = pdf_page_count(uploaded.getvalue())
+            except Exception:
+                st.error("This PDF couldn't be read. Please try a different file.")
                 return
-            scan = [(uploaded.name, data)]
-            st.info("This looks like a scanned PDF. I'll read it as images, which takes a bit longer.")
+            st.info(
+                "This looks like a scanned or handwritten PDF. I'll read it as "
+                f"images, which takes longer (up to {MAX_COMPRESS_SCAN_PAGES} pages at a time)."
+            )
         elif code:
             st.error(f"This PDF {ERR_TEXT[code]}. Please try a different file.")
             return
         else:
-            st.success(f"Read {len(pages)} pages")
-            start, end = 1, len(pages)  # default: the whole PDF
-            if st.checkbox("Only compress some pages", key="compress_range"):
-                start = st.number_input("From page", 1, len(pages), 1, key="compress_from")
-                end = st.number_input(
-                    "To page", start, len(pages), len(pages), key="compress_to"
-                )
+            n_pages = len(pages)
+            st.success(f"Read {n_pages} pages")
+        start, end = 1, n_pages
+        if st.checkbox("Only compress some pages", key="compress_range"):
+            start = st.number_input("From page", 1, n_pages, 1)
+            end = st.number_input("To page", start, n_pages, n_pages)
 
     if st.button("Compress notes", type="primary"):
         if not uploaded:
             st.warning("Upload your notes first.")
-        elif scan:
-            if allow_call():
-                with st.spinner("Reading and condensing your scanned notes..."):
+        elif scanned:
+            files, msg = vision_attachments(
+                [uploaded], start, end, MAX_COMPRESS_SCAN_PAGES
+            )
+            if files is None:
+                st.warning(msg)
+            elif allow_call():
+                if msg:
+                    st.caption(msg)
+                with st.spinner("Reading and condensing your notes..."):
                     try:
-                        text = ask(compress_prompt(SCAN_TARGET_WORDS[ratio], 1, 1, ""), files=scan)
+                        text = ask(
+                            compress_prompt(SCAN_TARGET_WORDS[ratio], 1, 1, ""),
+                            files=files,
+                        )
                     except Exception as e:
                         st.error(friendly_error(e))
                         text = None
@@ -1184,9 +1534,7 @@ def compress_tab():
                     for i, part in enumerate(parts, 1):
                         share = len(part.split()) / max(1, words)
                         target = max(200, int(target_total * share))
-                        results.append(
-                            ask(compress_prompt(target, i, len(parts), part))
-                        )
+                        results.append(ask(compress_prompt(target, i, len(parts), part)))
                         progress.progress(i / len(parts), text=f"Compressed part {i} of {len(parts)}")
                 except Exception as e:
                     st.error(friendly_error(e))
@@ -1244,7 +1592,11 @@ def similar_prompt(subject, typed, count, level, has_files):
         else DIFFICULTY_HINTS[level]
     )
     given = f"GIVEN QUESTIONS (typed):\n{typed}\n" if typed else ""
-    attached = "More given questions are attached as files.\n" if has_files else ""
+    attached = (
+        "More given questions are attached as files. " + HANDWRITING_RULE + "\n"
+        if has_files
+        else ""
+    )
     return (
         INJECTION_RULE
         + f"Subject: {subject or 'not specified'}.\n"
@@ -1276,7 +1628,7 @@ def similar_tab():
     ).strip()
     files = st.file_uploader(
         "...or upload a photo or PDF of the questions",
-        type=["pdf", "png", "jpg", "jpeg", "webp"],
+        type=["pdf"] + list(IMAGE_EXTS),
         accept_multiple_files=True,
         key="sim_files",
     )
@@ -1289,7 +1641,10 @@ def similar_tab():
     count = st.selectbox("How many new questions?", [3, 5, 8], key="sim_count")
 
     if st.button("Generate similar questions", type="primary"):
-        attachments = [(f.name, f.getvalue()) for f in (files or [])]
+        attachments = [
+            (f.name, f.getvalue()) if is_pdf(f) else shrink_image(f.name, f.getvalue())
+            for f in (files or [])
+        ]
         if not typed and not attachments:
             st.warning("Paste some questions or upload a photo/PDF first.")
         elif len(attachments) > 3:
