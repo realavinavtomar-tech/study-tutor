@@ -1,3 +1,4 @@
+import datetime
 import io
 import json
 import os
@@ -5,6 +6,7 @@ import random
 import re
 import threading
 import time
+import uuid
 
 import streamlit as st
 from dotenv import load_dotenv
@@ -37,6 +39,21 @@ CACHE_TTL = 6 * 3600
 COOLDOWN_SECONDS = 5
 MAX_REQUESTS_PER_SESSION = 30
 MAX_SIMILAR_CHARS = 4000
+SNAP_MAX_FILES = 3
+SNAP_MAX_PDF_PAGES = 6
+IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))  # India time
+SNAP_STYLES = {
+    "Step-by-step": (
+        "Give a clear step-by-step solution with the reasoning for each "
+        "step, then the final answer."
+    ),
+    "Quick answer": "Give the final answer with only the 3 to 5 key steps.",
+    "Exam answer": (
+        "Write a model exam answer worth {marks} marks: state the formula "
+        "or definition first, show labelled steps, give the final answer, "
+        "and keep the length suited to {marks} marks."
+    ),
+}
 MAX_COMPRESS_PART_CHARS = 100000  # one AI call per part, up to MAX_COMPRESS_PARTS
 MAX_COMPRESS_PARTS = 3
 
@@ -891,6 +908,7 @@ def show_plan(plan, days):
     with st.expander(f"Day-by-day plan ({days} day{'s' if days != 1 else ''} left)"):
         for label, items in build_schedule(topics, days):
             st.markdown(f"**{label}:** " + " · ".join(items))
+    calendar_section(plan, topics, days)
 
     if plan["questions"]:
         with st.expander("Likely questions"):
@@ -1674,23 +1692,314 @@ def similar_tab():
         )
 
 
+# ---------- Calendar export ----------
+def ics_escape(text):
+    return (
+        str(text)
+        .replace("\\", "\\\\")
+        .replace(";", "\\;")
+        .replace(",", "\\,")
+        .replace("\r\n", "\n")
+        .replace("\n", "\\n")
+    )
+
+
+def ics_fold(line):
+    """Fold long lines to 75 bytes (RFC 5545) without splitting a character."""
+    if len(line.encode("utf-8")) <= 75:
+        return [line]
+    pieces, current, size, limit = [], "", 0, 75
+    for ch in line:
+        n = len(ch.encode("utf-8"))
+        if size + n > limit:
+            pieces.append(current)
+            current, size, limit = ch, n, 74  # continuation lines start with a space
+        else:
+            current += ch
+            size += n
+    pieces.append(current)
+    return [pieces[0]] + [" " + piece for piece in pieces[1:]]
+
+
+def schedule_days(topics, days):
+    """One entry per calendar day: (day_number, label, items)."""
+    out = []
+    for label, items in build_schedule(topics, days):
+        nums = [int(n) for n in re.findall(r"\d+", label)]
+        if not nums:  # "Today"
+            nums = [1]
+        day_numbers = range(nums[0], nums[1] + 1) if len(nums) == 2 else nums
+        for d in day_numbers:
+            out.append((d, label, items))
+    return out
+
+
+def make_ics(subject, topics, days, start_date, start_time, minutes):
+    """Build a calendar file (.ics) with one study session per day plus the exam day."""
+    name = subject or "Exam"
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//BIT Study Tutor//Study plan//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "X-WR-CALNAME:" + ics_escape(f"Study plan: {name}"),
+    ]
+
+    def uid(*parts):
+        key = "/".join(["bit-study-tutor", name, str(start_date)] + [str(p) for p in parts])
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, key)) + "@bit-study-tutor"
+
+    for day, label, items in schedule_days(topics, days):
+        when = datetime.datetime.combine(start_date + datetime.timedelta(days=day - 1), start_time)
+        end = when + datetime.timedelta(minutes=minutes)
+        if items and items[0].startswith("Revise"):
+            summary = f"{name}: revision + practice quiz"
+        else:
+            shown = ", ".join(items[:2]) + (f" +{len(items) - 2} more" if len(items) > 2 else "")
+            summary = f"{name}: {shown}"
+        description = f"Day {day} of {days}.\n" + "\n".join(f"- {item}" for item in items)
+        description += f"\n\nPractise in BIT Study Tutor: {APP_URL}"
+        lines += [
+            "BEGIN:VEVENT",
+            f"UID:{uid('day', day)}",
+            f"DTSTAMP:{stamp}",
+            f"DTSTART:{when.strftime('%Y%m%dT%H%M%S')}",
+            f"DTEND:{end.strftime('%Y%m%dT%H%M%S')}",
+            "SUMMARY:" + ics_escape(summary),
+            "DESCRIPTION:" + ics_escape(description),
+            "BEGIN:VALARM",
+            "TRIGGER:-PT10M",
+            "ACTION:DISPLAY",
+            "DESCRIPTION:" + ics_escape("Study session starting soon"),
+            "END:VALARM",
+            "END:VEVENT",
+        ]
+
+    exam_day = start_date + datetime.timedelta(days=days)
+    lines += [
+        "BEGIN:VEVENT",
+        f"UID:{uid('exam')}",
+        f"DTSTAMP:{stamp}",
+        f"DTSTART;VALUE=DATE:{exam_day.strftime('%Y%m%d')}",
+        f"DTEND;VALUE=DATE:{(exam_day + datetime.timedelta(days=1)).strftime('%Y%m%d')}",
+        "SUMMARY:" + ics_escape(f"EXAM: {name}"),
+        "DESCRIPTION:" + ics_escape("You've prepared for this. Good luck!"),
+        "BEGIN:VALARM",
+        "TRIGGER:-P1D",
+        "ACTION:DISPLAY",
+        "DESCRIPTION:" + ics_escape("Exam tomorrow"),
+        "END:VALARM",
+        "END:VEVENT",
+        "END:VCALENDAR",
+    ]
+    folded = []
+    for line in lines:
+        folded.extend(ics_fold(line))
+    return ("\r\n".join(folded) + "\r\n").encode("utf-8")
+
+
+def calendar_section(plan, topics, days):
+    with st.expander("📅 Add this plan to your calendar"):
+        today = datetime.datetime.now(IST).date()
+        start_date = st.date_input("First study day", value=today, min_value=today)
+        start_time = st.time_input("Study time each day", value=datetime.time(18, 0), key="cal_time")
+        minutes = st.selectbox("Session length (minutes)", [30, 45, 60, 90, 120], index=2, key="cal_len")
+        exam_day = start_date + datetime.timedelta(days=days)
+        st.caption(
+            f"Your exam would be on {exam_day:%A, %d %B %Y} "
+            f"({days} day{'s' if days != 1 else ''} after your first study day)."
+        )
+        data = make_ics(plan["subject"], topics, days, start_date, start_time, minutes)
+        st.download_button(
+            "Download calendar file (.ics)",
+            data=data,
+            file_name="study-plan.ics",
+            mime="text/calendar",
+        )
+        st.caption(
+            "Open the downloaded file and choose 'Add to calendar'. It works "
+            "with Google Calendar, Apple Calendar and Outlook, and each study "
+            "day gets a reminder."
+        )
+
+
+# ---------- Snap & Solve ----------
+class NamedUpload:
+    """A camera photo wrapped like an uploaded file."""
+
+    def __init__(self, name, data):
+        self.name = name
+        self._data = data
+
+    def getvalue(self):
+        return self._data
+
+
+def snap_prompt(subject, style, marks):
+    return (
+        INJECTION_RULE
+        + "You are a patient tutor and examiner for BIT Mesra B.Tech students. "
+        f"Subject: {subject or 'not specified'}.\n"
+        "The attached image(s) contain exam or homework question(s). First "
+        "write **What I read** and copy each question exactly as written "
+        "(write [unclear] where you can't read something and say what you "
+        "assumed). Then write **Solution**. If there are several questions, "
+        "number them and solve each one separately. "
+        + SNAP_STYLES[style].format(marks=marks)
+        + " Write maths with LaTeX between $ signs. If data is missing, say "
+        "what you assumed. If the image has no question, say so briefly. "
+        + HANDWRITING_RULE
+    )
+
+
+def snap_check_prompt(solution):
+    return (
+        INJECTION_RULE
+        + "The attached image(s) contain exam question(s). A solution was "
+        "written for them (below). Solve the question(s) independently from "
+        "scratch, then compare with the given solution. Start with ONE "
+        "verdict line: '✅ The solution looks correct' or '⚠️ I found a "
+        "problem'. Then briefly list any mistakes and show the corrected "
+        "steps and final answer. Keep it short. Write maths with LaTeX "
+        "between $ signs. " + HANDWRITING_RULE
+        + "\n\nGIVEN SOLUTION:\n" + solution[:6000]
+    )
+
+
+def snap_followup_prompt(solution, question):
+    return (
+        INJECTION_RULE
+        + "You are a patient tutor. The attached image(s) contain the "
+        "student's question(s). Earlier you gave this solution:\n"
+        + solution[:6000]
+        + "\n\nThe student asks a follow-up:\n" + question
+        + "\n\nAnswer clearly and briefly, referring to the question in the "
+        "image(s). If the follow-up shows a mistake in your earlier "
+        "solution, say so and correct it. Write maths with LaTeX between $ "
+        "signs. " + HANDWRITING_RULE
+    )
+
+
+def snap_tab():
+    st.markdown(
+        "Take a photo of a question and get a full solution. It works with "
+        "handwriting and textbook pages."
+    )
+    uploads = st.file_uploader(
+        "Upload photo(s) of the question",
+        type=["pdf"] + list(IMAGE_EXTS),
+        accept_multiple_files=True,
+        key="snap_files",
+    ) or []
+    with st.expander("Or use your camera"):
+        shot = st.camera_input("Take a photo of the question", key="snap_camera")
+    subject = st.text_input("Subject (optional)", max_chars=80, key="snap_subject").strip()
+    style = st.radio("How should I solve it?", list(SNAP_STYLES), horizontal=True, key="snap_style")
+    marks = 5
+    if style == "Exam answer":
+        marks = st.selectbox("Marks", [2, 5, 10], index=1, key="snap_marks")
+    st.caption(
+        "Tip: good light, the whole question in the frame, and the page held "
+        "flat give the best results."
+    )
+
+    if st.button("Solve it", type="primary"):
+        items = list(uploads)
+        if shot is not None:
+            items.append(NamedUpload("camera.jpg", shot.getvalue()))
+        if not items:
+            st.warning("Add a photo of the question first.")
+        elif len(items) > SNAP_MAX_FILES:
+            st.warning(f"Please add at most {SNAP_MAX_FILES} photos or files at a time.")
+        else:
+            files, msg = vision_attachments(items, max_pages=SNAP_MAX_PDF_PAGES)
+            if files is None:
+                st.warning(msg)
+            elif allow_call():
+                if msg:
+                    st.caption(msg)
+                text = None
+                with st.spinner("Reading your question and solving it..."):
+                    try:
+                        text = ask(snap_prompt(subject, style, marks), files=files)
+                    except Exception as e:
+                        st.error(friendly_error(e))
+                if text:
+                    st.session_state["snap"] = {
+                        "files": files,
+                        "text": text,
+                        "check": None,
+                        "followups": [],
+                    }
+
+    snap = st.session_state.get("snap")
+    if not snap:
+        return
+    st.divider()
+    st.subheader("Solution")
+    st.markdown(snap["text"])
+    st.download_button(
+        "Download solution",
+        data=snap["text"],
+        file_name="solution.txt",
+        mime="text/plain",
+    )
+    st.caption("AI can make mistakes, especially in maths. Use Double-check if the answer matters.")
+
+    if st.button("Double-check this solution"):
+        if allow_call():
+            with st.spinner("Solving it again to compare..."):
+                try:
+                    snap["check"] = ask(snap_check_prompt(snap["text"]), files=snap["files"])
+                except Exception as e:
+                    st.error(friendly_error(e))
+    if snap["check"]:
+        st.markdown("**Double-check**")
+        st.markdown(snap["check"])
+
+    follow = st.text_input("Not clear? Ask a follow-up", max_chars=300, key="snap_follow").strip()
+    if st.button("Ask follow-up"):
+        if not follow:
+            st.warning("Type your follow-up question first.")
+        elif allow_call():
+            with st.spinner("Thinking..."):
+                try:
+                    answer = ask(snap_followup_prompt(snap["text"], follow), files=snap["files"])
+                    snap["followups"].append((follow, answer))
+                except Exception as e:
+                    st.error(friendly_error(e))
+    for question, answer in snap["followups"]:
+        st.markdown(f"**You:** {question}")
+        st.markdown(answer)
+
+
 # ---------- Page ----------
 st.title("BIT Study Tutor")
 st.caption("AI answers can be wrong, especially in maths. Always double-check.")
 st.markdown(
-    "**Exam in a few days?** See what to study, get a day-by-day plan, "
-    "shrink long notes into a short PDF, practise similar questions, and "
-    "get your answers graded."
+    "**Exam in a few days?** See what to study, add your plan to your "
+    "calendar, snap a photo of any question for a full solution, shrink long "
+    "notes into a short PDF, and practise similar questions."
 )
 
 if client is None:
     st.error("The tutor isn't set up yet (missing API key).")
 else:
-    tab_exam, tab_study, tab_compress, tab_similar = st.tabs(
-        ["🎯 Exam Mode", "📖 Study a topic", "🗜️ Compress notes", "🧪 Similar questions"]
+    tab_exam, tab_snap, tab_study, tab_compress, tab_similar = st.tabs(
+        [
+            "🎯 Exam Mode",
+            "📸 Snap & Solve",
+            "📖 Study a topic",
+            "🗜️ Compress notes",
+            "🧪 Similar questions",
+        ]
     )
     with tab_exam:
         exam_tab()
+    with tab_snap:
+        snap_tab()
     with tab_study:
         study_tab()
     with tab_compress:
