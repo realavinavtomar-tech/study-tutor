@@ -6,6 +6,7 @@ import random
 import re
 import threading
 import time
+import urllib.parse
 import uuid
 
 import streamlit as st
@@ -41,6 +42,17 @@ MAX_REQUESTS_PER_SESSION = 30
 MAX_SIMILAR_CHARS = 4000
 SNAP_MAX_FILES = 3
 SNAP_MAX_PDF_PAGES = 6
+MAX_EXPERIMENTS = 12
+LAB_QUIZ_HINT = (
+    "This is a lab quiz: ask about the aim, apparatus, circuit connections, "
+    "procedure, readings and calculations, expected results, precautions, "
+    "sources of error, and viva-style conceptual questions."
+)
+SHARE_APP_TEXT = (
+    "Found a free study tool built by a BIT Mesra student: upload past papers "
+    "to see what's likely, snap a photo of any question for a solution, make "
+    "a last-hour sheet, prepare for lab vivas and more. "
+)
 IST = datetime.timezone(datetime.timedelta(hours=5, minutes=30))  # India time
 SNAP_STYLES = {
     "Step-by-step": (
@@ -623,7 +635,7 @@ def sheet_prompt(subject, days, topics, questions, notes_text, notes_attached=Fa
     )
 
 
-def quiz_prompt(subject, topics, questions, notes_text, notes_attached=False, difficulty="Medium"):
+def quiz_prompt(subject, topics, questions, notes_text, notes_attached=False, difficulty="Medium", extra=""):
     topic_list = ", ".join(t["name"] for t in topics)
     q_list = "\n".join(f"- {q['question']}" for q in questions) or "none"
     return (
@@ -632,6 +644,7 @@ def quiz_prompt(subject, topics, questions, notes_text, notes_attached=False, di
         f"covering these topics: {topic_list}.\n"
         "Make them conceptual and exam-style, not trivia. "
         + DIFFICULTY_HINTS.get(difficulty, DIFFICULTY_HINTS["Medium"])
+        + ((" " + extra) if extra else "")
         + " Past paper "
         f"patterns for reference:\n{q_list}\n"
         "Return ONLY valid JSON in exactly this shape:\n"
@@ -778,11 +791,11 @@ def build_schedule(topics, days):
 
 
 # ---------- Exam Mode: UI ----------
-def reset_quiz():
-    quiz = st.session_state.pop("quiz", None) or []
+def reset_quiz(ns=""):
+    quiz = st.session_state.pop(f"{ns}quiz", None) or []
     for i in range(max(len(quiz), 12)):
-        st.session_state.pop(f"q{i}", None)
-    st.session_state.pop("quiz_result", None)
+        st.session_state.pop(f"{ns}q{i}", None)
+    st.session_state.pop(f"{ns}quiz_result", None)
 
 
 def load_notes(notes_uploads):
@@ -878,6 +891,7 @@ def build_plan(pyq_files, subject):
     plan["subject"] = subject
     st.session_state["exam_plan"] = plan
     st.session_state.pop("exam_sheet", None)
+    st.session_state.pop("last_hour", None)
     st.session_state.pop("grade_result", None)
     reset_quiz()
 
@@ -909,6 +923,12 @@ def show_plan(plan, days):
         for label, items in build_schedule(topics, days):
             st.markdown(f"**{label}:** " + " · ".join(items))
     calendar_section(plan, topics, days)
+    plan_text = (
+        f"My study plan for {plan['subject'] or 'my exam'} (made with BIT Study Tutor):\n"
+        + "\n".join(f"{i}. {t['name']}" for i, t in enumerate(topics[:6], 1))
+        + f"\n\nBuild yours: {APP_URL}"
+    )
+    st.link_button("Share my plan on WhatsApp", whatsapp_link(plan_text))
 
     if plan["questions"]:
         with st.expander("Likely questions"):
@@ -917,12 +937,15 @@ def show_plan(plan, days):
                 st.markdown(f"- {q['question']}{marks}")
 
 
-def make_quiz(subject, topics, questions, notes_text, notes_files, difficulty="Medium"):
+def make_quiz(subject, topics, questions, notes_text, notes_files, difficulty="Medium", ns="", extra=""):
     quiz = []
     with st.spinner("Preparing your quiz..."):
         try:
             data = ask_json(
-                quiz_prompt(subject, topics, questions, notes_text, bool(notes_files), difficulty),
+                quiz_prompt(
+                    subject, topics, questions, notes_text,
+                    bool(notes_files), difficulty, extra,
+                ),
                 files=notes_files,
                 cache=False,  # a retake should give new questions
                 require="questions",
@@ -932,28 +955,28 @@ def make_quiz(subject, topics, questions, notes_text, notes_files, difficulty="M
             st.error(friendly_error(e))
             return False
     if len(quiz) >= 3:
-        reset_quiz()
-        st.session_state["quiz"] = quiz
+        reset_quiz(ns)
+        st.session_state[f"{ns}quiz"] = quiz
         return True
     st.error("Couldn't build a quiz this time. Please try again.")
     return False
 
 
-def show_quiz(subject):
+def show_quiz(subject, ns="", label="exam quiz"):
     """Show the quiz and result. Returns the weak topics (worst first)."""
-    quiz = st.session_state.get("quiz")
+    quiz = st.session_state.get(f"{ns}quiz")
     if not quiz:
         return []
     st.divider()
-    st.subheader("Practice quiz")
-    with st.form("quiz_form"):
+    st.subheader("Lab quiz" if ns == "lab" else "Practice quiz")
+    with st.form(f"{ns}quiz_form"):
         for i, q in enumerate(quiz):
             st.markdown(f"**Q{i + 1}. {q['question']}**")
             st.radio(
                 "Choose one",
                 q["options"],
                 index=None,
-                key=f"q{i}",
+                key=f"{ns}q{i}",
                 label_visibility="collapsed",
             )
         submitted = st.form_submit_button("Submit answers")
@@ -963,7 +986,7 @@ def show_quiz(subject):
         weak = {}
         details = []
         for i, q in enumerate(quiz):
-            choice = st.session_state.get(f"q{i}")
+            choice = st.session_state.get(f"{ns}q{i}")
             correct = q["options"][q["answer"]]
             ok = choice == correct
             if ok:
@@ -971,14 +994,14 @@ def show_quiz(subject):
             else:
                 weak[q["topic"]] = weak.get(q["topic"], 0) + 1
             details.append((q, choice, correct, ok))
-        st.session_state["quiz_result"] = {
+        st.session_state[f"{ns}quiz_result"] = {
             "score": score,
             "total": len(quiz),
             "weak": weak,
             "details": details,
         }
 
-    result = st.session_state.get("quiz_result")
+    result = st.session_state.get(f"{ns}quiz_result")
     if not result:
         return []
     st.success(f"You scored {result['score']}/{result['total']}")
@@ -986,11 +1009,15 @@ def show_quiz(subject):
     if ranked:
         st.markdown("**Revise these topics:** " + ", ".join(ranked))
     for_whom = f" for {subject}" if subject else ""
-    st.caption("Share your score:")
-    st.code(
+    share_text = (
         f"I scored {result['score']}/{result['total']} on the BIT Study Tutor "
-        f"exam quiz{for_whom}. Can you beat me? {APP_URL}",
-        language=None,
+        f"{label}{for_whom}. Can you beat me? {APP_URL}"
+    )
+    st.caption("Share your score:")
+    st.code(share_text, language=None)
+    st.link_button(
+        "Share my score on WhatsApp" if not ns else f"Share my {label} score on WhatsApp",
+        whatsapp_link(share_text),
     )
     with st.expander("See answers and explanations"):
         for i, (q, choice, correct, ok) in enumerate(result["details"], 1):
@@ -1115,7 +1142,7 @@ def exam_tab():
     difficulty = st.select_slider(
         "Quiz difficulty", ["Easy", "Medium", "Hard"], value="Medium", key="exam_difficulty"
     )
-    c1, c2 = st.columns(2)
+    c1, c2, c3 = st.columns(3)
     if c1.button("Create revision sheet"):
         if allow_call():
             with st.spinner("Writing your revision sheet..."):
@@ -1132,6 +1159,19 @@ def exam_tab():
     if c2.button("Practice quiz"):
         if allow_call():
             make_quiz(subject, topics, plan["questions"], notes_text, notes_files, difficulty)
+    if c3.button("⚡ Last-hour sheet"):
+        if allow_call():
+            with st.spinner("Writing your last-hour sheet..."):
+                try:
+                    st.session_state["last_hour"] = ask(
+                        last_hour_prompt(
+                            subject, topics, plan["questions"],
+                            notes_text, bool(notes_files),
+                        ),
+                        files=notes_files,
+                    )
+                except Exception as e:
+                    st.error(friendly_error(e))
 
     sheet = st.session_state.get("exam_sheet")
     if sheet:
@@ -1143,6 +1183,20 @@ def exam_tab():
             data=sheet,
             file_name="revision-sheet.txt",
             mime="text/plain",
+        )
+
+    last_hour = st.session_state.get("last_hour")
+    if last_hour:
+        st.divider()
+        st.subheader("⚡ Last-hour sheet")
+        st.markdown(last_hour)
+        show_downloads(f"Last-hour sheet: {subject or 'exam'}", last_hour, "last-hour-sheet")
+        st.link_button(
+            "Share my sheet on WhatsApp",
+            whatsapp_link(
+                f"I made a last-hour revision sheet for {subject or 'my exam'} "
+                f"with BIT Study Tutor. Try it before your exam: {APP_URL}"
+            ),
         )
 
     weak = show_quiz(subject)
@@ -1975,22 +2029,391 @@ def snap_tab():
         st.markdown(answer)
 
 
+# ---------- Sharing + downloads ----------
+def whatsapp_link(text):
+    return "https://wa.me/?text=" + urllib.parse.quote(text[:900], safe="")
+
+
+def show_downloads(title, text, base_name):
+    """PDF (when available) and plain-text download buttons."""
+    pdf_bytes = None
+    if HAS_PDF:
+        try:
+            pdf_bytes = make_pdf(title, text)
+        except Exception as e:
+            print(f"[tutor] pdf error: {e}")
+    if pdf_bytes:
+        st.download_button(
+            "Download as PDF",
+            data=pdf_bytes,
+            file_name=f"{base_name}.pdf",
+            mime="application/pdf",
+            key=f"dl_pdf_{base_name}",
+        )
+    st.download_button(
+        "Download as text",
+        data=text,
+        file_name=f"{base_name}.txt",
+        mime="text/plain",
+        key=f"dl_txt_{base_name}",
+    )
+
+
+def last_hour_prompt(subject, topics, questions, notes_text, notes_attached=False):
+    topic_list = "\n".join(f"{i}. {t['name']}" for i, t in enumerate(topics, 1))
+    q_list = (
+        "\n".join(f"- ({q['marks']} marks) {q['question']}" for q in questions)
+        or "none"
+    )
+    return (
+        TUTOR_RULES
+        + INJECTION_RULE
+        + f"Create a LAST-HOUR revision sheet for {subject or 'this subject'}. "
+        "The student has one hour left before the exam. It must fit on ONE "
+        "A4 page (about 450 words), so be extremely selective.\n"
+        f"Topics, most important first:\n{topic_list}\n"
+        "Use exactly these sections, in markdown:\n"
+        "# Last-hour sheet\n"
+        "## Must-know formulas and definitions\n"
+        "## Likely questions with one-line answers\n"
+        "## Common mistakes to avoid\n"
+        "## 5-minute checklist\n"
+        "Use bullet points starting with '- '. No tables, no code blocks, no "
+        "LaTeX: write formulas in plain text with symbols like x², →, ≤, Σ.\n"
+        f"Likely questions from past papers:\n{q_list}\n\n"
+        + notes_source(notes_text, notes_attached, strict=False)
+    )
+
+
+# ---------- Lab & Viva ----------
+def parse_experiments(text):
+    out = []
+    for line in (text or "").splitlines():
+        name = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", line).strip()
+        if name and name.lower() not in [o.lower() for o in out]:
+            out.append(name[:100])
+    return out[:MAX_EXPERIMENTS]
+
+
+def lab_source(uploads):
+    """Return (text, files, note, ok) for a lab manual, record pages or photos."""
+    uploads = uploads or []
+    if not uploads:
+        return "", [], None, True
+    if len(uploads) == 1 and is_pdf(uploads[0]):
+        pages, code = load_pdf(uploads[0])
+        if code is None:
+            return "\n\n".join(pages)[:MAX_MATERIAL_CHARS], [], None, True
+        if code != "scanned":
+            return "", [], f"This PDF {ERR_TEXT[code]}. Please try a different file.", False
+    files, msg = vision_attachments(uploads, max_pages=MAX_VISION_PAGES)
+    if files is None:
+        return "", [], msg, False
+    return "", files, msg, True
+
+
+def lab_material(text, files):
+    if text:
+        return "LAB MANUAL / NOTES:\n" + text
+    if files:
+        return "The lab manual or record pages are attached. " + HANDWRITING_RULE
+    return "No manual was provided. Use standard B.Tech lab knowledge."
+
+
+def lab_experiments_line(experiments):
+    if experiments:
+        return "Experiments:\n" + "\n".join(f"- {e}" for e in experiments)
+    return "Cover every experiment you find in the material."
+
+
+def lab_cards_prompt(lab, experiments, detailed, material):
+    detail = (
+        "Be thorough (about 450 words per experiment)."
+        if detailed
+        else "Keep each experiment under 200 words."
+    )
+    return (
+        TUTOR_RULES
+        + INJECTION_RULE
+        + f"Lab: {lab or 'not specified'}.\n"
+        "Create revision cards for the experiments below. For each "
+        "experiment use a markdown heading '## Experiment name', then these "
+        "bold labels with bullet points under each: **Aim**, **Apparatus**, "
+        "**Theory** (key formulas), **Circuit / setup** (describe the "
+        "connections in words), **Procedure** (numbered steps), "
+        "**Observations to record**, **Calculations** (one sample "
+        "calculation), **Result**, **Precautions**, **3 likely viva "
+        "questions with short answers**. "
+        + detail
+        + " No tables, no code blocks, no LaTeX: write formulas in plain "
+        "text with symbols like x², Ω, µ, π. Prefer details from the "
+        "material when it gives them (values, procedure); otherwise use "
+        "standard knowledge.\n"
+        + lab_experiments_line(experiments)
+        + "\n\n"
+        + material
+    )
+
+
+def lab_viva_prompt(lab, experiments, count, difficulty, material):
+    return (
+        TUTOR_RULES
+        + INJECTION_RULE
+        + f"Lab: {lab or 'not specified'}.\n"
+        f"Write {count} viva questions with short model answers (1 to 3 "
+        "lines each) for the experiments below, grouped by experiment. Mix "
+        "theory, circuit connections, reading and result interpretation, "
+        "precautions and sources of error. "
+        + DIFFICULTY_HINTS[difficulty]
+        + "\nFormat: a markdown heading '## Experiment name', then "
+        "'**Q1.** question' on one line and 'Answer: ...' on the next.\n"
+        + lab_experiments_line(experiments)
+        + "\n\n"
+        + material
+    )
+
+
+def viva_prompt(lab, experiments, difficulty, history, answered, total, material):
+    transcript = "\n".join(
+        f"{'EXAMINER' if role == 'examiner' else 'STUDENT'}: {msg}"
+        for role, msg in history[-16:]
+    )
+    if not history:
+        turn = f"This is the start. Greet the student in one short line, then ask question 1 of {total}."
+    elif answered >= total:
+        turn = (
+            "The student has answered the last question. Give brief feedback "
+            "on that answer, then a final summary: a score out of 10, what "
+            "they did well, and the 3 topics to revise. Do not ask another question."
+        )
+    else:
+        turn = (
+            "Give brief feedback on the student's last answer: start with ✅ "
+            "correct, ⚠️ partly correct or ❌ incorrect, then the correct "
+            f"answer in one or two lines. Then ask question {answered + 1} of {total}."
+        )
+    return (
+        INJECTION_RULE
+        + "You are a friendly but strict lab examiner conducting a viva for "
+        f"BIT Mesra B.Tech students. Lab: {lab or 'not specified'}. "
+        + DIFFICULTY_HINTS[difficulty]
+        + " Ask one question at a time, starting easier and getting harder. "
+        "Keep every reply short. Plain text, no LaTeX.\n"
+        + lab_experiments_line(experiments)
+        + f"\n\n{material}\n\nCONVERSATION SO FAR:\n{transcript or '(none yet)'}\n\n"
+        + turn
+    )
+
+
+def viva_section(lab, experiments, difficulty, text, files):
+    st.subheader("Mock viva")
+    st.caption("An examiner asks one question at a time, marks each answer, and gives a final score.")
+    total = st.selectbox("Number of questions", [5, 8, 10], index=1, key="viva_total")
+    material = lab_material(text, files)
+
+    viva = st.session_state.get("viva")
+    if st.button("Restart mock viva" if viva else "Start mock viva", type="primary"):
+        if not experiments and not text and not files:
+            st.warning("Type your experiment names or upload your lab manual first.")
+        elif allow_call():
+            first = None
+            with st.spinner("The examiner is getting ready..."):
+                try:
+                    first = ask(
+                        viva_prompt(lab, experiments, difficulty, [], 0, total, material),
+                        files=files or None,
+                        cache=False,
+                    )
+                except Exception as e:
+                    st.error(friendly_error(e))
+            if first:
+                st.session_state["viva"] = {
+                    "history": [("examiner", first)],
+                    "answered": 0,
+                    "total": total,
+                    "done": False,
+                }
+                st.rerun()
+
+    viva = st.session_state.get("viva")
+    if not viva:
+        return
+    for role, msg in viva["history"]:
+        with st.chat_message("assistant" if role == "examiner" else "user"):
+            st.markdown(msg)
+
+    if viva["done"]:
+        st.success("Viva finished. Check your score above.")
+        transcript = "\n\n".join(
+            f"{'Examiner' if role == 'examiner' else 'You'}: {msg}"
+            for role, msg in viva["history"]
+        )
+        st.download_button(
+            "Download viva transcript",
+            data=transcript,
+            file_name="viva-transcript.txt",
+            mime="text/plain",
+            key="dl_viva",
+        )
+        st.link_button(
+            "Share my viva on WhatsApp",
+            whatsapp_link(
+                f"I just did a mock lab viva on BIT Study Tutor{(' for ' + lab) if lab else ''}. "
+                f"Try it before your lab exam: {APP_URL}"
+            ),
+        )
+        return
+
+    answer = st.text_area(
+        "Your answer",
+        max_chars=1500,
+        height=100,
+        key=f"viva_answer_{viva['answered']}",
+    ).strip()
+    if st.button("Send answer"):
+        if not answer:
+            st.warning("Type your answer first.")
+        elif allow_call():
+            history = viva["history"] + [("student", answer)]
+            answered = viva["answered"] + 1
+            reply = None
+            with st.spinner("The examiner is marking your answer..."):
+                try:
+                    reply = ask(
+                        viva_prompt(lab, experiments, difficulty, history, answered, viva["total"], material),
+                        files=files or None,
+                        cache=False,
+                    )
+                except Exception as e:
+                    st.error(friendly_error(e))
+            if reply:
+                viva["history"] = history + [("examiner", reply)]
+                viva["answered"] = answered
+                viva["done"] = answered >= viva["total"]
+                st.rerun()
+
+
+def lab_tab():
+    st.markdown(
+        "Get ready for lab quizzes and vivas. Upload your lab manual, record "
+        "pages or circuit photos, or just type the experiment names."
+    )
+    lab = st.text_input("Lab / subject (optional)", max_chars=80, key="lab_name").strip()
+    uploads = st.file_uploader(
+        "Lab manual, record pages or circuit photos (optional)",
+        type=["pdf"] + list(IMAGE_EXTS),
+        accept_multiple_files=True,
+        key="lab_files",
+    ) or []
+    experiments = parse_experiments(
+        st.text_area(
+            "Experiments, one per line (leave blank to use everything in your upload)",
+            max_chars=1500,
+            height=110,
+            key="lab_experiments",
+        )
+    )
+    difficulty = st.select_slider(
+        "Difficulty", ["Easy", "Medium", "Hard"], value="Medium", key="lab_difficulty"
+    )
+    mode = st.radio(
+        "What do you want?",
+        ["Experiment cards", "Viva Q&A", "Lab quiz", "Mock viva"],
+        horizontal=True,
+        key="lab_mode",
+    )
+
+    text, files, note, ok = lab_source(uploads)
+    if not ok:
+        st.error(note)
+        return
+    if note:
+        st.caption(note)
+    if experiments:
+        st.caption(f"{len(experiments)} experiment(s): " + ", ".join(experiments))
+
+    def has_input():
+        if experiments or text or files:
+            return True
+        st.warning("Type your experiment names or upload your lab manual first.")
+        return False
+
+    material = lab_material(text, files)
+    outputs = st.session_state.setdefault("lab_out", {})
+
+    if mode == "Experiment cards":
+        detailed = st.radio(
+            "Detail", ["Compact", "Detailed (up to 3 experiments)"],
+            horizontal=True, key="lab_detail",
+        ).startswith("Detailed")
+        if st.button("Create experiment cards", type="primary") and has_input():
+            if detailed and (not experiments or len(experiments) > 3):
+                st.warning("For detailed cards, list 1 to 3 experiments. Or choose Compact.")
+            elif allow_call():
+                with st.spinner("Writing your experiment cards..."):
+                    try:
+                        outputs["cards"] = ask(
+                            lab_cards_prompt(lab, experiments, detailed, material),
+                            files=files or None,
+                        )
+                    except Exception as e:
+                        st.error(friendly_error(e))
+        if outputs.get("cards"):
+            st.divider()
+            st.markdown(outputs["cards"])
+            show_downloads(f"Lab cards: {lab or 'experiments'}", outputs["cards"], "lab-cards")
+
+    elif mode == "Viva Q&A":
+        count = st.selectbox("How many questions?", [10, 20, 30], key="lab_viva_count")
+        if st.button("Create viva questions", type="primary") and has_input():
+            if allow_call():
+                with st.spinner("Writing viva questions..."):
+                    try:
+                        outputs["viva_qa"] = ask(
+                            lab_viva_prompt(lab, experiments, count, difficulty, material),
+                            files=files or None,
+                        )
+                    except Exception as e:
+                        st.error(friendly_error(e))
+        if outputs.get("viva_qa"):
+            st.divider()
+            st.markdown(outputs["viva_qa"])
+            show_downloads(f"Viva questions: {lab or 'lab'}", outputs["viva_qa"], "viva-questions")
+
+    elif mode == "Lab quiz":
+        topics = [{"name": e} for e in experiments] or [{"name": "all experiments in the material"}]
+        if st.button("Make lab quiz", type="primary") and has_input():
+            if allow_call():
+                make_quiz(lab, topics, [], text, files, difficulty, ns="lab", extra=LAB_QUIZ_HINT)
+        weak = show_quiz(lab, ns="lab", label="lab quiz")
+        if weak and st.button("Quiz me on my weak experiments"):
+            if allow_call():
+                weak_topics = [{"name": w} for w in weak[:4]]
+                if make_quiz(lab, weak_topics, [], text, files, difficulty, ns="lab", extra=LAB_QUIZ_HINT):
+                    st.rerun()
+
+    else:
+        viva_section(lab, experiments, difficulty, text, files)
+
+
 # ---------- Page ----------
 st.title("BIT Study Tutor")
 st.caption("AI answers can be wrong, especially in maths. Always double-check.")
 st.markdown(
-    "**Exam in a few days?** See what to study, add your plan to your "
-    "calendar, snap a photo of any question for a full solution, shrink long "
-    "notes into a short PDF, and practise similar questions."
+    "**Exam in a few days?** See what to study, make a last-hour sheet, "
+    "snap a photo of any question for a full solution, prepare for lab "
+    "vivas, shrink long notes into a short PDF, and practise similar "
+    "questions."
 )
 
 if client is None:
     st.error("The tutor isn't set up yet (missing API key).")
 else:
-    tab_exam, tab_snap, tab_study, tab_compress, tab_similar = st.tabs(
+    tab_exam, tab_snap, tab_lab, tab_study, tab_compress, tab_similar = st.tabs(
         [
             "🎯 Exam Mode",
             "📸 Snap & Solve",
+            "🔬 Lab & Viva",
             "📖 Study a topic",
             "🗜️ Compress notes",
             "🧪 Similar questions",
@@ -2000,6 +2423,8 @@ else:
         exam_tab()
     with tab_snap:
         snap_tab()
+    with tab_lab:
+        lab_tab()
     with tab_study:
         study_tab()
     with tab_compress:
@@ -2010,9 +2435,10 @@ else:
 st.divider()
 motivation = st.session_state.setdefault("motivation", random.choice(MOTIVATION))
 st.info(f"💪 {motivation}")
+st.link_button("📲 Share this app on WhatsApp", whatsapp_link(SHARE_APP_TEXT + APP_URL))
 feedback = f" · [Give feedback]({FEEDBACK_URL})" if FEEDBACK_URL else ""
 st.caption(
-    "Built by Avinav Tomar · 1st-year CSE, BIT Mesra · "
+    "Built by Avinav Tomar · K26 CSE, BIT Mesra · "
     "[GitHub](https://github.com/realavinavtomar-tech) · "
     "[LinkedIn](https://www.linkedin.com/in/avinav-tomar-973152299/)"
     f"{feedback}"
